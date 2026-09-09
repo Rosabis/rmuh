@@ -1,0 +1,447 @@
+name: Build Kenji-NX Android APK
+
+# 从 git.ryujinx.app 拉取 Kenji-NX 源码 -> 构建 Android APK -> 上传 artifacts
+#
+# 关键点（务必先看）：
+#   1. Kenji-NX 的 master 分支里 **没有** Android 工程。官方在 v2.0.5 前后把 Android /
+#      流式加载相关改动从 master 回退了，Android 代码现在只存在于 `libryujinx_bionic`
+#      分支。所以本工作流默认 ref = libryujinx_bionic。
+#   2. Android 工程是「Gradle 外壳 + NativeAOT 内核」的混合结构：
+#        src/LibKenjinx         -> C#，用 NativeAOT 编成 libkenjinx.so (linux-bionic-arm64)
+#        src/KenjinxAndroid     -> Android Studio / Gradle 工程，打包成 APK
+#      Gradle 的 :libkenjinx:compileLibKenjinx 任务会自动调用
+#      `dotnet publish -r linux-bionic-arm64`，并把 libkenjinx.so 同步到
+#      app/src/main/jniLibs/arm64-v8a。所以只要保证 NDK 的 LLVM 工具链在 PATH 上，
+#      直接跑 gradlew assembleXxx 即可完成整条链路。
+#   3. NativeAOT 编 bionic 需要 Android NDK 的 clang/lld 在 PATH 首位，见
+#      https://github.com/dotnet/runtime/blob/main/src/coreclr/nativeaot/docs/android-bionic.md
+#   4. app/src/main/cpp/libraries/{adrenotools,openal} 是 git submodule，必须递归拉取。
+#   5. release 变体用的是 signingConfigs.debug（app/build.gradle 里写死的），
+#      因此不需要自备 keystore；产物是可安装的 debug 签名 APK。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Kenji-NX 源码分支 / 标签 / commit（需要含 Android 工程，默认 libryujinx_bionic）'
+        required: false
+        default: libryujinx_bionic
+      flavor:
+        description: '变体（appid 维度 + device 维度）'
+        required: false
+        default: mainlineArmv82
+        type: choice
+        options:
+          - mainlineArmv8      # -march=armv8-a，兼容性最好
+          - mainlineArmv82     # -march=armv8.2-a，官方常用
+          - mainlineArmv87     # -march=armv8.7-a
+          - mainlineSd8eg5     # -march=armv8.7-a+sve+sve2
+          - optimizedArmv82    # 包名 com.garena.game.codm，用于绕开厂商游戏调度限制
+      build_type:
+        description: '构建类型'
+        required: false
+        default: Release
+        type: choice
+        options:
+          - Release
+          - Debug
+      ndk_version:
+        description: 'Android NDK 版本（同时用于 NativeAOT 与 Gradle/CMake）'
+        required: false
+        default: '27.2.12479018'
+      android_platform:
+        description: '要安装的 Android SDK 平台 API 级别（需与 app/build.gradle 的 compileSdk 一致）'
+        required: false
+        default: '37'
+  push:
+    branches: [ main, master ]
+    paths:
+      - '.github/workflows/build-kenjinx-android.yml'
+      - 'scripts/**'
+  # 如需每周自动构建，取消下面注释
+  # schedule:
+  #   - cron: '0 18 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kenjinx-android-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: 1
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
+  POWERSHELL_TELEMETRY_OPTOUT: 1
+  KENJI_REF: ${{ github.event.inputs.ref || 'libryujinx_bionic' }}
+  KENJI_FLAVOR: ${{ github.event.inputs.flavor || 'mainlineArmv82' }}
+  KENJI_BUILD_TYPE: ${{ github.event.inputs.build_type || 'Release' }}
+  NDK_VERSION: ${{ github.event.inputs.ndk_version || '27.2.12479018' }}
+  ANDROID_PLATFORM: ${{ github.event.inputs.android_platform || '37' }}
+
+jobs:
+  build:
+    name: ${{ github.event.inputs.flavor || 'mainlineArmv82' }} / ${{ github.event.inputs.build_type || 'Release' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      # -----------------------------------------------------------------
+      # 1. 腾一点磁盘空间（Android SDK + NDK + Gradle 缓存很占地方）
+      # -----------------------------------------------------------------
+      - name: Free disk space
+        shell: bash
+        run: |
+          df -h / || true
+          sudo rm -rf /usr/share/dotnet /usr/local/share/boost /opt/ghc /usr/lib/mono 2>/dev/null || true
+          sudo apt-get clean 2>/dev/null || true
+          df -h / || true
+
+      # -----------------------------------------------------------------
+      # 2. 取本仓库的构建脚本（源码不入库，CI 只取 .github + scripts）
+      # -----------------------------------------------------------------
+      - name: Checkout build scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github
+            scripts
+
+      # -----------------------------------------------------------------
+      # 3. 浅克隆 Kenji-NX + 递归拉取子模块
+      #    （openal 记录的 commit 不在分支尖端，--depth 1 可能失败，故加全量兜底）
+      # -----------------------------------------------------------------
+      - name: Clone Kenji-NX
+        id: clone
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.KENJI_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${TOKEN:-}" ]; then
+            URL="https://${TOKEN}@git.ryujinx.app/projects/Kenji-NX.git"
+          else
+            URL="https://git.ryujinx.app/projects/Kenji-NX.git"
+          fi
+          mkdir -p kenjinx
+          cd kenjinx
+          git init -q .
+          git remote add origin "$URL"
+          git fetch --depth 1 origin "$KENJI_REF"
+          git checkout -q FETCH_HEAD
+
+          echo "拉取子模块 (adrenotools / openal-soft / linkernsbypass) ..."
+          if ! git -c protocol.version=2 submodule update --init --recursive --depth 1; then
+            echo "浅层子模块失败，改用全量拉取 ..."
+            git submodule update --init --recursive
+          fi
+          git submodule status --recursive || true
+
+          # subject 可能含引号/换行，压平后再写，避免污染 GITHUB_OUTPUT
+          SUBJECT="$(git log -1 --format=%s | tr '\r\n' '  ')"
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            echo "short=$(git rev-parse --short HEAD)"
+            echo "subject=$SUBJECT"
+            echo "date=$(git log -1 --format=%cI)"
+          } >> "$GITHUB_OUTPUT"
+          echo "已检出 ${KENJI_REF} -> $(git rev-parse --short HEAD)"
+
+      - name: Verify Android project present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -d kenjinx/src/KenjinxAndroid ] || [ ! -d kenjinx/src/LibKenjinx ]; then
+            echo "::error::ref '$KENJI_REF' 里没有 Android 工程。" \
+                 "Kenji-NX 的 Android 代码只在 'libryujinx_bionic' 分支上；" \
+                 "master 分支已把 Android 相关改动回退掉了。"
+            exit 1
+          fi
+          echo "OK: 找到 src/KenjinxAndroid 与 src/LibKenjinx"
+
+      # -----------------------------------------------------------------
+      # 4. JDK + Android SDK
+      # -----------------------------------------------------------------
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        id: sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${ANDROID_HOME:=${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          : "${ANDROID_SDK_ROOT:=${ANDROID_HOME}}"
+          export ANDROID_HOME ANDROID_SDK_ROOT
+          echo "ANDROID_HOME: $ANDROID_HOME"
+
+          SDKMGR="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKMGR" ] || SDKMGR="$(command -v sdkmanager)"
+          echo "sdkmanager: $SDKMGR"
+
+          yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
+
+          "$SDKMGR" --install \
+            "platform-tools" \
+            "build-tools;37.0.0" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;4.1.2"
+
+          # API 37 这类新平台有时只发布 37.0 / 37.1 / 37.2 这样的带扩展级别路径，
+          # 没有裸 android-37，这里做一次兜底选择。
+          if ! "$SDKMGR" --install "platforms;android-${ANDROID_PLATFORM}" > /dev/null 2>&1; then
+            PLAT="$("$SDKMGR" --list 2>/dev/null \
+              | grep -oE "platforms;android-${ANDROID_PLATFORM}(\.[0-9]+)?" \
+              | sort -V | tail -n 1 || true)"
+            if [ -z "$PLAT" ]; then
+              echo "::error::找不到 platforms;android-${ANDROID_PLATFORM}*"
+              exit 1
+            fi
+            echo "未找到 platforms;android-${ANDROID_PLATFORM}，改用 ${PLAT}"
+            "$SDKMGR" --install "$PLAT"
+          fi
+
+          NDK_HOME="${ANDROID_HOME}/ndk/${NDK_VERSION}"
+          [ -d "$NDK_HOME" ] || NDK_HOME="$(ls -d "${ANDROID_HOME}"/ndk/* 2>/dev/null | tail -n 1 || true)"
+          NDK_LLVM="${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          [ -d "$NDK_LLVM" ] || { echo "::error::找不到 NDK LLVM 工具链: $NDK_LLVM"; exit 1; }
+
+          echo "NDK_HOME : $NDK_HOME"
+          echo "NDK LLVM : $NDK_LLVM"
+          ls "$ANDROID_HOME"
+          ls "$ANDROID_HOME/platforms" || true
+
+          {
+            echo "ndk_home=$NDK_HOME"
+            echo "ndk_llvm=$NDK_LLVM"
+          } >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------
+      # 5. .NET SDK（版本由 Kenji-NX 的 global.json 决定，当前 9.0.100）
+      # -----------------------------------------------------------------
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: kenjinx/global.json
+
+      - name: Show toolchain info
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet --info
+          java -version 2>&1 | head -n 1
+          "${{ steps.sdk.outputs.ndk_llvm }}/clang" --version | head -n 1
+
+      - name: Cache NuGet + Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.nuget/packages
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-kenjinx-${{ hashFiles('kenjinx/global.json', 'kenjinx/Directory.Packages.props', 'kenjinx/src/**/*.csproj', 'kenjinx/src/KenjinxAndroid/**/*.gradle*') }}
+          restore-keys: |
+            ${{ runner.os }}-kenjinx-
+
+      # -----------------------------------------------------------------
+      # 6. 定制改动
+      #    a) 锁定 NDK 版本，避免 AGP 自动下载一个跟 NativeAOT 不一致的 NDK
+      #    b) NativeAOT 编 bionic 共享库的已知问题：
+      #       version script assignment of 'V1.0' to symbol '_init' failed
+      #       官方 workaround: -Wl,--undefined-version
+      #       https://github.com/dotnet/runtime/issues/92272
+      # -----------------------------------------------------------------
+      - name: Patch sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$NDK_VERSION" <<'PY'
+          import os, sys
+
+          ndk = sys.argv[1]
+
+          # --- a) 注入 ndkVersion -------------------------------------------
+          app = 'kenjinx/src/KenjinxAndroid/app/build.gradle'
+          s = open(app, encoding='utf-8').read()
+          if 'ndkVersion' not in s:
+              marker = 'android {'
+              assert marker in s, 'app/build.gradle 里没找到 android { 块'
+              s = s.replace(marker, marker + '\n    ndkVersion "%s"' % ndk, 1)
+              open(app, 'w', encoding='utf-8').write(s)
+              print('注入 ndkVersion =', ndk)
+
+          # --- b) bionic 共享库链接兜底 --------------------------------------
+          tgt = 'kenjinx/src/LibKenjinx/Directory.Build.targets'
+          if not os.path.exists(tgt):
+              open(tgt, 'w', encoding='utf-8').write('''<Project>
+            <!-- 由 CI 注入：bionic 共享库链接的 --undefined-version 兜底。
+                 见 https://github.com/dotnet/runtime/issues/92272 -->
+            <ItemGroup Condition="'$(RuntimeIdentifier)' == 'linux-bionic-arm64'">
+              <LinkerArg Include="-Wl,--undefined-version" />
+            </ItemGroup>
+          </Project>
+          ''')
+              print('写入', tgt)
+          PY
+
+          cd kenjinx
+          git --no-pager diff --stat || true
+
+      # -----------------------------------------------------------------
+      # 7. 构建 libkenjinx.so + APK
+      #    Gradle 的 preBuild 依赖 :libkenjinx:assemble，会自动跑 dotnet publish。
+      #    NDK 的 LLVM bin 通过 org.kenjinx.llvm.toolchain.path 传给 dotnet 子进程，
+      #    同时也放进 PATH 作为兜底。
+      # -----------------------------------------------------------------
+      - name: Build APK
+        shell: bash
+        env:
+          NDK_LLVM: ${{ steps.sdk.outputs.ndk_llvm }}
+          NDK_HOME: ${{ steps.sdk.outputs.ndk_home }}
+        run: |
+          set -euo pipefail
+          export PATH="$NDK_LLVM:$PATH"
+          export ANDROID_NDK_HOME="$NDK_HOME"
+          export ANDROID_NDK_ROOT="$NDK_HOME"
+
+          CFG="$(echo "$KENJI_BUILD_TYPE" | tr '[:upper:]' '[:lower:]')"
+          TASK=":app:assemble${KENJI_FLAVOR}${KENJI_BUILD_TYPE}"
+
+          cd kenjinx/src/KenjinxAndroid
+          chmod +x gradlew
+
+          echo "Gradle task : $TASK"
+          ./gradlew "$TASK" \
+            -Porg.kenjinx.config="$CFG" \
+            -Porg.kenjinx.llvm.toolchain.path="$NDK_LLVM" \
+            --no-daemon \
+            || ./gradlew "$TASK" \
+                 -Porg.kenjinx.config="$CFG" \
+                 -Porg.kenjinx.llvm.toolchain.path="$NDK_LLVM" \
+                 --no-daemon --stacktrace
+
+      # -----------------------------------------------------------------
+      # 8. 收集产物
+      # -----------------------------------------------------------------
+      - name: Collect artifacts
+        id: collect
+        shell: bash
+        env:
+          KENJI_COMMIT: ${{ steps.clone.outputs.commit }}
+          KENJI_SHORT: ${{ steps.clone.outputs.short }}
+          KENJI_SUBJECT: ${{ steps.clone.outputs.subject }}
+          KENJI_DATE: ${{ steps.clone.outputs.date }}
+        run: |
+          set -euo pipefail
+          APK_DIR="kenjinx/src/KenjinxAndroid/app/build/outputs/apk"
+          if [ ! -d "$APK_DIR" ]; then
+            echo "::error::没找到 APK 输出目录: $APK_DIR"
+            find kenjinx/src/KenjinxAndroid/app/build/outputs -maxdepth 2 2>/dev/null || true
+            exit 1
+          fi
+
+          APK="$(find "$APK_DIR" -type f -name '*.apk' | head -n 1)"
+          [ -n "$APK" ] || { echo "::error::$APK_DIR 下没有 .apk"; find "$APK_DIR" -type f | head -n 30; exit 1; }
+          echo "原始产物: $APK"
+
+          VERSION="$(python3 - <<'PY'
+          import re, os
+          p = 'kenjinx/src/KenjinxAndroid/app/build.gradle'
+          s = open(p, encoding='utf-8').read()
+          m = re.search(r"versionName\s+'([^']+)'", s) or re.search(r'versionName\s+"([^"]+)"', s)
+          print(m.group(1) if m else 'unknown')
+          PY
+          )"
+          VERSION_CODE="$(python3 - <<'PY'
+          import re
+          p = 'kenjinx/src/KenjinxAndroid/app/build.gradle'
+          s = open(p, encoding='utf-8').read()
+          m = re.search(r'versionCode\s+(\d+)', s)
+          print(m.group(1) if m else '0')
+          PY
+          )"
+
+          NAME="Kenji-NX-${KENJI_FLAVOR}-${KENJI_BUILD_TYPE}-${VERSION}-${KENJI_SHORT}"
+          OUT="artifact/$NAME"
+          mkdir -p "$OUT"
+
+          cp "$APK" "$OUT/$NAME.apk"
+
+          # 未 strip 的 libkenjinx.so 对排查崩溃很有用，一并带上
+          SO="$(find kenjinx/src/KenjinxAndroid -type f -name 'libkenjinx.so' | head -n 1)"
+          [ -n "$SO" ] && cp "$SO" "$OUT/libkenjinx.so" || true
+
+          {
+            echo "Kenji-NX Android build"
+            echo "----------------------"
+            echo "Source repo  : https://git.ryujinx.app/projects/Kenji-NX.git"
+            echo "Commit       : ${KENJI_COMMIT} (${KENJI_SHORT})"
+            echo "Ref          : ${KENJI_REF}"
+            echo "Subject      : ${KENJI_SUBJECT}"
+            echo "Commit date  : ${KENJI_DATE}"
+            echo "Flavor       : ${KENJI_FLAVOR}"
+            echo "Build type   : ${KENJI_BUILD_TYPE}"
+            echo "versionName  : ${VERSION}"
+            echo "versionCode  : ${VERSION_CODE}"
+            echo "NDK          : ${NDK_VERSION}"
+            echo "ABI          : arm64-v8a"
+            echo "minSdk       : 29"
+            echo "Signing      : debug keystore (app/build.gradle: release 使用 signingConfigs.debug)"
+            echo "Built at     : $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
+            echo "Run          : ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > "$OUT/BUILD-INFO.txt"
+
+          echo "--- BUILD-INFO.txt ---"
+          cat "$OUT/BUILD-INFO.txt"
+          echo "--- files ---"
+          ls -la "$OUT"
+
+          {
+            echo "name=$NAME"
+            echo "dir=$OUT"
+            echo "version=$VERSION"
+            echo "version_code=$VERSION_CODE"
+          } >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------
+      # 9. 上传 artifacts
+      # -----------------------------------------------------------------
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.collect.outputs.name }}
+          path: ${{ steps.collect.outputs.dir }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Summary
+        shell: bash
+        env:
+          KENJI_SHORT: ${{ steps.clone.outputs.short }}
+          KENJI_SUBJECT: ${{ steps.clone.outputs.subject }}
+          KENJI_ARTIFACT: ${{ steps.collect.outputs.name }}
+          KENJI_VERSION: ${{ steps.collect.outputs.version }}
+          KENJI_VERSION_CODE: ${{ steps.collect.outputs.version_code }}
+        run: |
+          {
+            echo '## Kenji-NX Android 构建完成'
+            echo ''
+            echo '| 项 | 值 |'
+            echo '|---|---|'
+            echo "| Commit | \`${KENJI_SHORT}\` (${KENJI_SUBJECT}) |"
+            echo "| Ref | \`${KENJI_REF}\` |"
+            echo "| 变体 | \`${KENJI_FLAVOR}\` |"
+            echo "| 类型 | \`${KENJI_BUILD_TYPE}\` |"
+            echo "| 版本 | \`${KENJI_VERSION}\` (code ${KENJI_VERSION_CODE}) |"
+            echo "| ABI | \`arm64-v8a\` |"
+            echo "| NDK | \`${NDK_VERSION}\` |"
+            echo "| 签名 | debug keystore |"
+            echo "| Artifact | \`${KENJI_ARTIFACT}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
