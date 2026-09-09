@@ -98,10 +98,12 @@ jobs:
           git remote add origin "$URL"
           git fetch --depth 1 origin "$RYUBING_REF"
           git checkout -q FETCH_HEAD
+          # subject 可能含引号/换行，压平后再写，避免污染 GITHUB_OUTPUT
+          SUBJECT="$(git log -1 --format=%s | tr '\r\n' '  ')"
           {
             echo "commit=$(git rev-parse HEAD)"
             echo "short=$(git rev-parse --short HEAD)"
-            echo "subject=$(git log -1 --format=%s)"
+            echo "subject=$SUBJECT"
             echo "date=$(git log -1 --format=%cI)"
           } >> "$GITHUB_OUTPUT"
           echo "已检出 ${RYUBING_REF} -> $(git rev-parse --short HEAD)"
@@ -174,6 +176,9 @@ jobs:
       # -----------------------------------------------------------------
       - name: Publish
         shell: pwsh
+        env:
+          RYU_VERSION: ${{ steps.ver.outputs.version }}
+          RYU_SHORT: ${{ steps.clone.outputs.short }}
         run: |
           $ErrorActionPreference = 'Stop'
           dotnet publish ryubing/src/Ryujinx/Ryujinx.csproj `
@@ -181,8 +186,8 @@ jobs:
             -r "$env:RYUBING_RID" `
             -o publish `
             --self-contained `
-            -p:Version="${{ steps.ver.outputs.version }}" `
-            -p:SourceRevisionId="${{ steps.clone.outputs.short }}" `
+            -p:Version="$env:RYU_VERSION" `
+            -p:SourceRevisionId="$env:RYU_SHORT" `
             -p:DebugType=embedded `
             -p:ExtraDefineConstants=DISABLE_UPDATER `
             -p:CETCompat=false
@@ -223,25 +228,36 @@ jobs:
       - name: Package
         id: package
         shell: pwsh
+        # 注意：commit subject 等外部文本可能含引号，
+        # 一律走环境变量传入，避免 ${{ }} 内联进脚本后被 PowerShell 解析炸掉
+        env:
+          RYU_COMMIT: ${{ steps.clone.outputs.commit }}
+          RYU_SHORT: ${{ steps.clone.outputs.short }}
+          RYU_SUBJECT: ${{ steps.clone.outputs.subject }}
+          RYU_VERSION: ${{ steps.ver.outputs.version }}
+          RYU_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path artifact | Out-Null
 
           # Windows 包不需要 macOS 的 dylib
-          Get-ChildItem -LiteralPath publish -Filter '*.dylib' -File -ErrorAction SilentlyContinue | Remove-Item -Force
+          # 注意：不要写 Get-ChildItem | Remove-Item，PS5.1 下管道绑定会失败
+          foreach ($d in @(Get-ChildItem -LiteralPath publish -Filter '*.dylib' -File -ErrorAction SilentlyContinue)) {
+            Remove-Item -LiteralPath $d.FullName -Force
+          }
 
           $infoLines = @(
             'Ryubing (Ryujinx) Windows build - CET disabled',
             '----------------------------------------------',
             'Source repo : https://git.ryujinx.app/projects/Ryubing.git',
-            "Commit      : ${{ steps.clone.outputs.commit }} (${{ steps.clone.outputs.short }})",
+            "Commit      : $env:RYU_COMMIT ($env:RYU_SHORT)",
             "Ref         : $env:RYUBING_REF",
-            "Subject     : ${{ steps.clone.outputs.subject }}",
-            'Version     : ${{ steps.ver.outputs.version }}',
+            "Subject     : $env:RYU_SUBJECT",
+            "Version     : $env:RYU_VERSION",
             "RID         : $env:RYUBING_RID",
             "Config      : $env:BUILD_CONFIG",
             "Built at    : $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')) UTC",
-            'Run         : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
+            "Run         : $env:RYU_RUN_URL",
             '',
             'CET (Control-flow Enforcement Technology / shadow stack) is DISABLED for',
             'this build: <CETCompat>false</CETCompat> is injected into',
@@ -254,7 +270,7 @@ jobs:
           )
           Set-Content -LiteralPath (Join-Path 'publish' 'BUILD-INFO.txt') -Value ($infoLines -join "`n") -Encoding utf8
 
-          $name = "Ryubing-$env:RYUBING_RID-${{ steps.ver.outputs.version }}-noCET" -replace '[+]', '-'
+          $name = "Ryubing-$env:RYUBING_RID-$env:RYU_VERSION-noCET" -replace '[+]', '-'
           $zip  = "artifact/$name.zip"
           Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
 
@@ -284,19 +300,24 @@ jobs:
 
       - name: Summary
         shell: pwsh
+        env:
+          RYU_SHORT: ${{ steps.clone.outputs.short }}
+          RYU_SUBJECT: ${{ steps.clone.outputs.subject }}
+          RYU_VERSION: ${{ steps.ver.outputs.version }}
+          RYU_ARTIFACT: ${{ steps.package.outputs.name }}
         run: |
           $lines = @(
             '## Ryubing Windows 构建完成',
             '',
-            "| 项 | 值 |",
-            "|---|---|",
-            "| Commit | ``${{ steps.clone.outputs.short }}`` (${{ steps.clone.outputs.subject }}) |",
+            '| 项 | 值 |',
+            '|---|---|',
+            "| Commit | ``$env:RYU_SHORT`` ($env:RYU_SUBJECT) |",
             "| Ref | ``$env:RYUBING_REF`` |",
             "| RID | ``$env:RYUBING_RID`` |",
             "| 配置 | ``$env:BUILD_CONFIG`` |",
-            "| 版本 | ``${{ steps.ver.outputs.version }}`` |",
-            "| CET | 已禁用 (``<CETCompat>false</CETCompat>``) |",
-            "| Artifact | ``${{ steps.package.outputs.name }}`` |",
+            "| 版本 | ``$env:RYU_VERSION`` |",
+            '| CET | 已禁用 (``<CETCompat>false</CETCompat>``) |',
+            "| Artifact | ``$env:RYU_ARTIFACT`` |",
             ''
           )
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ($lines -join "`n")
