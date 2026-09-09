@@ -288,6 +288,24 @@ jobs:
           </Project>
           ''')
               print('写入', tgt)
+
+          # --- c) 修上游漏改的 NCE LoadDiskCache 签名 ------------------------
+          #     libryujinx_bionic 合并 master 的 PtcCacheInfo 重构时，Jit/AppleHv/
+          #     LightningJit 三个 CPU context 都改了，唯独漏了 Android 专用的
+          #     NceCpuContext（CS0535）。NCE 原生执行客户机代码、不做重编译，
+          #     磁盘缓存无意义，与 HvCpuContext 一致返回 DummyDiskCacheLoadState。
+          p = 'kenjinx/src/Ryujinx.Cpu/Nce/NceCpuContext.cs'
+          s = open(p, encoding='utf-8').read()
+          if 'LoadDiskCache(PtcCacheInfo' not in s:
+              old = 'public IDiskCacheLoadState LoadDiskCache(string titleIdText, string displayVersion, bool enabled, string cacheSelector)'
+              new = 'public IDiskCacheLoadState LoadDiskCache(PtcCacheInfo cacheInfo, bool enabled)'
+              assert old in s, 'NceCpuContext: 未找到旧版 LoadDiskCache 签名（上游代码有变动，需人工检查）'
+              s = s.replace(old, new, 1)
+              if 'using ARMeilleure.Translation.PTC;' not in s:
+                  s = s.replace('using ARMeilleure.Memory;',
+                                'using ARMeilleure.Memory;\nusing ARMeilleure.Translation.PTC;', 1)
+              open(p, 'w', encoding='utf-8').write(s)
+              print('修复 NceCpuContext.LoadDiskCache 签名 -> (PtcCacheInfo, bool)')
           PY
 
           # 防呆：立即校验注入的 XML 是否合法（曾因注释里含 '--undefined-version'
