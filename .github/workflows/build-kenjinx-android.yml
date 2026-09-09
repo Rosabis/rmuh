@@ -281,14 +281,21 @@ jobs:
           tgt = 'kenjinx/src/LibKenjinx/Directory.Build.targets'
           if not os.path.exists(tgt):
               open(tgt, 'w', encoding='utf-8').write('''<Project>
-            <!-- 由 CI 注入：bionic 共享库链接的 --undefined-version 兜底。
-                 见 https://github.com/dotnet/runtime/issues/92272 -->
+            <!-- CI 注入：bionic 共享库链接 undefined-version 兜底（dotnet runtime issue 92272）。 -->
             <ItemGroup Condition="'$(RuntimeIdentifier)' == 'linux-bionic-arm64'">
               <LinkerArg Include="-Wl,--undefined-version" />
             </ItemGroup>
           </Project>
           ''')
               print('写入', tgt)
+          PY
+
+          # 防呆：立即校验注入的 XML 是否合法（曾因注释里含 '--undefined-version'
+          # 触发 MSB4024，等 Gradle 跑到 dotnet 才失败，排查成本高）
+          python3 - <<'PY'
+          import xml.dom.minidom
+          xml.dom.minidom.parse('kenjinx/src/LibKenjinx/Directory.Build.targets')
+          print('Directory.Build.targets XML OK')
           PY
 
           cd kenjinx
