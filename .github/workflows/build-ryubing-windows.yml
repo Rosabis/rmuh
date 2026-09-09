@@ -1,0 +1,302 @@
+name: Build Ryubing Windows (CET disabled)
+
+# 从 git.ryujinx.app 拉取 Ryubing 源码 -> 去掉 CET 支持 -> 构建 Windows 版 -> 上传 artifacts
+#
+# CET 相关背景见 scripts/Remove-RyubingCetSupport.ps1 头部说明与
+# https://github.com/dotnet/runtime/issues/110920
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Ryubing 源码分支 / 标签 / commit'
+        required: false
+        default: master
+      rid:
+        description: '目标运行时'
+        required: false
+        default: win-x64
+        type: choice
+        options:
+          - win-x64
+          - win-arm64
+      configuration:
+        description: '构建配置'
+        required: false
+        default: Release
+        type: choice
+        options:
+          - Release
+          - Debug
+      base_version:
+        description: '基础版本号（生成 <base>-ci.<run>+<hash>）'
+        required: false
+        default: '1.3.2'
+  push:
+    branches: [ main, master ]
+    paths:
+      - '.github/workflows/build-ryubing-windows.yml'
+      - 'scripts/**'
+  # 如需每周自动构建，取消下面注释
+  # schedule:
+  #   - cron: '0 18 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ryubing-win-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: 1
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
+  POWERSHELL_TELEMETRY_OPTOUT: 1
+  RYUBING_REF: ${{ github.event.inputs.ref || 'master' }}
+  RYUBING_RID: ${{ github.event.inputs.rid || 'win-x64' }}
+  BUILD_CONFIG: ${{ github.event.inputs.configuration || 'Release' }}
+
+jobs:
+  build:
+    # 注意：job 的 name 里不能用 env 上下文，只能用 inputs / github
+    name: ${{ github.event.inputs.rid || 'win-x64' }} / ${{ github.event.inputs.configuration || 'Release' }}
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      # -----------------------------------------------------------------
+      # 1. 取本仓库的构建脚本
+      # -----------------------------------------------------------------
+      - name: Checkout build scripts
+        uses: actions/checkout@v4
+        with:
+          # 本仓库里 ryubing/ 是源码快照副本，体积很大，CI 只需要脚本
+          sparse-checkout: |
+            .github
+            scripts
+
+      # -----------------------------------------------------------------
+      # 2. 浅克隆 Ryubing（分支 / 标签 / commit 统一用 fetch，避免 --branch 不支持 sha）
+      #    仓库公开时无需凭证；若将来改为私有，配置 secret RYUBING_TOKEN 即可
+      # -----------------------------------------------------------------
+      - name: Clone Ryubing
+        id: clone
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.RYUBING_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${TOKEN:-}" ]; then
+            URL="https://${TOKEN}@git.ryujinx.app/projects/Ryubing.git"
+          else
+            URL="https://git.ryujinx.app/projects/Ryubing.git"
+          fi
+          mkdir -p ryubing
+          cd ryubing
+          git init -q .
+          git remote add origin "$URL"
+          git fetch --depth 1 origin "$RYUBING_REF"
+          git checkout -q FETCH_HEAD
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            echo "short=$(git rev-parse --short HEAD)"
+            echo "subject=$(git log -1 --format=%s)"
+            echo "date=$(git log -1 --format=%cI)"
+          } >> "$GITHUB_OUTPUT"
+          echo "已检出 ${RYUBING_REF} -> $(git rev-parse --short HEAD)"
+
+      # -----------------------------------------------------------------
+      # 3. .NET SDK（版本由 Ryubing 的 global.json 决定，当前为 10.0.301）
+      # -----------------------------------------------------------------
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: ryubing/global.json
+
+      - name: Show dotnet info
+        shell: pwsh
+        run: dotnet --info
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('ryubing/global.json', 'ryubing/Directory.Packages.props', 'ryubing/src/**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      # -----------------------------------------------------------------
+      # 4. 去掉 CET 支持（核心改动）
+      # -----------------------------------------------------------------
+      - name: Remove CET support
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/Remove-RyubingCetSupport.ps1 -RepoRoot ryubing
+          if ($LASTEXITCODE -ne 0) { throw "Remove-RyubingCetSupport.ps1 失败 (exit=$LASTEXITCODE)" }
+
+      - name: Show CET patch diff
+        shell: bash
+        run: |
+          cd ryubing
+          git --no-pager diff --stat
+          git --no-pager diff -- Directory.Build.props src/Ryujinx/Ryujinx.csproj || true
+
+      # -----------------------------------------------------------------
+      # 5. 版本号 + 填充 ReleaseInformation 占位符
+      #    有意不替换 RYUJINX_TARGET_RELEASE_CHANNEL_NAME，
+      #    使 ReleaseInformation.IsValid == false，不会走 canary/release 更新逻辑
+      # -----------------------------------------------------------------
+      - name: Compute version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="${{ github.event.inputs.base_version || '1.3.2' }}"
+          VERSION="${BASE}-ci.${{ github.run_number }}+${{ steps.clone.outputs.short }}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION"
+
+      - name: Stamp release information
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd ryubing
+          F=src/Ryujinx.Common/ReleaseInformation.cs
+          sed -i "s|%%RYUJINX_BUILD_VERSION%%|${{ steps.ver.outputs.version }}|g" "$F"
+          sed -i "s|%%RYUJINX_BUILD_GIT_HASH%%|${{ steps.clone.outputs.short }}|g" "$F"
+          sed -i "s|%%RYUJINX_CONFIG_FILE_NAME%%|Config.json|g" "$F"
+          grep -n "private const string" "$F"
+
+      # -----------------------------------------------------------------
+      # 6. 构建并发布（-p:CETCompat=false 为命令行兜底，优先级高于项目文件）
+      # -----------------------------------------------------------------
+      - name: Publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet publish ryubing/src/Ryujinx/Ryujinx.csproj `
+            -c "$env:BUILD_CONFIG" `
+            -r "$env:RYUBING_RID" `
+            -o publish `
+            --self-contained `
+            -p:Version="${{ steps.ver.outputs.version }}" `
+            -p:SourceRevisionId="${{ steps.clone.outputs.short }}" `
+            -p:DebugType=embedded `
+            -p:ExtraDefineConstants=DISABLE_UPDATER `
+            -p:CETCompat=false
+          if ($LASTEXITCODE -ne 0) { throw "dotnet publish 失败 (exit=$LASTEXITCODE)" }
+
+      - name: Verify CETCompat is disabled
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = (dotnet msbuild ryubing/src/Ryujinx/Ryujinx.csproj -getProperty:CETCompat -p:CETCompat=false -nologo | Out-String).Trim()
+          Write-Host "CETCompat = '$v'"
+          if ($v -ne 'false') { throw "CETCompat 未生效: '$v'" }
+
+          # 尽力而为：用 MSVC 的 dumpbin 复核产物 PE 标记（找不到就跳过）
+          $exe = Join-Path 'publish' 'Ryujinx.exe'
+          if (Test-Path $exe) {
+            $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $dumpbin = $null
+            if (Test-Path $vsWhere) {
+              $installPath = & $vsWhere -latest -property installationPath 2>$null
+              if ($installPath) {
+                $dumpbin = Get-ChildItem -Path $installPath -Filter 'dumpbin.exe' -Recurse -File -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -match 'Hostx64\\x64|Hostx86\\x86' } | Select-Object -First 1 -ExpandProperty FullName
+              }
+            }
+            if ($dumpbin) {
+              Write-Host "dumpbin: $dumpbin"
+              & $dumpbin /headers $exe 2>&1 | Select-String -Pattern 'CET|Dll characteristics|DLL characteristics' | ForEach-Object { Write-Host $_.Line }
+            }
+            else {
+              Write-Host "未找到 dumpbin，跳过产物 PE 标记复核（不影响构建结果）。" -ForegroundColor Yellow
+            }
+          }
+
+      # -----------------------------------------------------------------
+      # 7. 打包
+      # -----------------------------------------------------------------
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path artifact | Out-Null
+
+          # Windows 包不需要 macOS 的 dylib
+          Get-ChildItem -LiteralPath publish -Filter '*.dylib' -File -ErrorAction SilentlyContinue | Remove-Item -Force
+
+          $infoLines = @(
+            'Ryubing (Ryujinx) Windows build - CET disabled',
+            '----------------------------------------------',
+            'Source repo : https://git.ryujinx.app/projects/Ryubing.git',
+            "Commit      : ${{ steps.clone.outputs.commit }} (${{ steps.clone.outputs.short }})",
+            "Ref         : $env:RYUBING_REF",
+            "Subject     : ${{ steps.clone.outputs.subject }}",
+            'Version     : ${{ steps.ver.outputs.version }}',
+            "RID         : $env:RYUBING_RID",
+            "Config      : $env:BUILD_CONFIG",
+            "Built at    : $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')) UTC",
+            'Run         : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
+            '',
+            'CET (Control-flow Enforcement Technology / shadow stack) is DISABLED for',
+            'this build: <CETCompat>false</CETCompat> is injected into',
+            'Directory.Build.props and src/Ryujinx/Ryujinx.csproj, and',
+            '-p:CETCompat=false is passed on the command line.',
+            'This avoids the .NET 9+ apphost /CETCOMPAT default that causes',
+            '  0xc0000602 (STATUS_FAIL_FAST_EXCEPTION) / coreclr assert',
+            '  !AreShadowStacksEnabled() || UseSpecialUserModeApc()',
+            'on some Windows builds. See https://github.com/dotnet/runtime/issues/110920'
+          )
+          Set-Content -LiteralPath (Join-Path 'publish' 'BUILD-INFO.txt') -Value ($infoLines -join "`n") -Encoding utf8
+
+          $name = "Ryubing-$env:RYUBING_RID-${{ steps.ver.outputs.version }}-noCET" -replace '[+]', '-'
+          $zip  = "artifact/$name.zip"
+          Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+
+          if (Get-Command 7z -ErrorAction SilentlyContinue) {
+            & 7z a -tzip -mx=7 -bso0 -bsp0 $zip (Join-Path (Get-Location) 'publish\*')
+            if ($LASTEXITCODE -ne 0) { throw "7z 打包失败" }
+          }
+          else {
+            Compress-Archive -Path (Join-Path (Get-Location) 'publish\*') -DestinationPath $zip -CompressionLevel Optimal
+          }
+
+          $size = [math]::Round((Get-Item $zip).Length / 1MB, 2)
+          Write-Host "打包完成: $zip ($size MB)"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "name=$name"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "zip=$zip"
+
+      # -----------------------------------------------------------------
+      # 8. 上传 artifacts
+      # -----------------------------------------------------------------
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.zip }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          $lines = @(
+            '## Ryubing Windows 构建完成',
+            '',
+            "| 项 | 值 |",
+            "|---|---|",
+            "| Commit | ``${{ steps.clone.outputs.short }}`` (${{ steps.clone.outputs.subject }}) |",
+            "| Ref | ``$env:RYUBING_REF`` |",
+            "| RID | ``$env:RYUBING_RID`` |",
+            "| 配置 | ``$env:BUILD_CONFIG`` |",
+            "| 版本 | ``${{ steps.ver.outputs.version }}`` |",
+            "| CET | 已禁用 (``<CETCompat>false</CETCompat>``) |",
+            "| Artifact | ``${{ steps.package.outputs.name }}`` |",
+            ''
+          )
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ($lines -join "`n")
